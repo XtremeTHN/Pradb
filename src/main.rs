@@ -1,6 +1,3 @@
-use gtk::{Application, Box, Grid, Label};
-use adw::{ApplicationWindow, HeaderBar, prelude::*};
-
 mod adb;
 
 fn main() {

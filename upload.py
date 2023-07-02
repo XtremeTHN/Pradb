@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-import toml, os, argparse, sys
+import toml, os, argparse, sys, requests
 from colorama import Fore, Style
 
 def println(*values, prefix_style="::::", end='\n'):
@@ -15,7 +15,15 @@ def read(*values):
     return input()
 
 def is_connected():
-    return False
+    # Source: https://stackoverflow.com/a/62078034 .
+    url = 'http://www.google.com/'
+    timeout = 5
+    try:
+        _ = requests.get(url, timeout=timeout)
+        return True
+    except requests.ConnectionError:
+        return False
+
 
 parser = argparse.ArgumentParser(prog="Uploader")
 parser.add_argument("-n", "--new-version", action="store_true", dest="nv")
