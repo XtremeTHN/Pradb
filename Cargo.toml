@@ -1,0 +1,16 @@
+[package]
+name = "AdbTUI"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+log = "0.4.19"
+
+[dependencies.adw]
+version = "0.4.4"
+package = "libadwaita"
+features = [ "v1_3",]
+
+[dependencies.gtk]
+version = "0.6.6"
+package = "gtk4"
