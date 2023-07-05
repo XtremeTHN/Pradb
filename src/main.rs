@@ -2,7 +2,10 @@ mod adb;
 
 fn main() {
     let mut ok = adb::Adb::new().unwrap();
-    println!("{:?}", ok.devices().unwrap());
+    println!("{:?}", ok.get_serial_no());
+    // println!("Device: {} Adb version: {}", ok.devices().unwrap().unwrap()[0], ok.version().unwrap());
+    // ok.connect_local(String::from("MJTK6P65OJVW8DT8"));
+    // ok.close();
 }
 
 
