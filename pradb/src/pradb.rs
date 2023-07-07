@@ -1,6 +1,6 @@
-use std::collections::HashMap;
 use std::hash::Hash;
 use std::io::{self, Read, Write};
+use std::collections::HashMap;
 use std::net::TcpStream;
 use std::time::Instant;
 use thiserror::Error;
@@ -18,10 +18,15 @@ pub enum AdbSocketError {
     WriteError(#[from] io::Error)
 }
 
-/// Adb client for sending commands to the adb server
-pub struct Adb {
-    s: TcpStream
+#[derive(Debug, Error)]
+pub enum AdbDeviceError {
+    #[error("The specified serial number cannot be found in the connected devices")]
+    DeviceNotFound(String),
+    #[error("Placeholder")]
+    GeneralErrors(#[from] PradbErrors)
 }
+
+
 
 // Enum representing the possible results returned by the server
 #[derive(Debug)]
@@ -31,9 +36,9 @@ pub enum Response {
     Unknown(String)
 }
 
-// General errors
+/// General errors
 #[derive(Debug, Error)]
-pub enum Errors {
+pub enum PradbErrors {
     #[error("Response of OKAY expected")]
     ResponseRelated(Response),
     #[error("Adb socket related")]
@@ -44,16 +49,27 @@ pub enum Errors {
     Unknown(Option<String>)
 }
 
-// Future device class
-struct Device {
-    adb: Adb,
+/// Adb client for sending commands to the adb server
+pub struct Adb {
+    s: TcpStream
 }
 
-impl Device {
+
+
+/// Future device class
+#[derive(Debug)]
+pub struct Device {
+    sock: TcpStream,
+    serial_no: String,
+    model: String,
 }
+
+// impl Device {
+//     pub fn try_clone(&self) -> Result<Self, >
+// }
 
 impl Adb {
-    // Constructs a new Adb instance and runs the server if it isn't running
+    /// Constructs a new Adb instance and runs the server if it isn't running
     pub fn new() -> Result<Self, AdbSocketError> {
         env_logger::init();
         info!("Adb::new(): Creating connection to the adb server");
@@ -71,7 +87,7 @@ impl Adb {
         }
     }
 
-    // Private method; Sends the gived command to the server
+    /// Private method; Sends the gived command to the server
     fn _exec_cmd(&mut self, cmd: &str) -> Result<Response, AdbSocketError> {
         debug!("[Adb::_exec_cmd()]: _exec_cmd called with command '{}'...", cmd);
         debug!("[Adb::_exec_cmd()]: Preparing header...");
@@ -132,51 +148,78 @@ impl Adb {
 
     }
 
-    // Return a list of devices
-    pub fn devices(&mut self) -> Result<Option<Vec<String>>, Errors> {
+    /// Return a list of devices
+    pub fn devices(&mut self) -> Result<Vec<Device>, PradbErrors> {
         let devices = self._exec_cmd("host:devices");
         match devices {
-            Ok(Response::Ok(rp)) => {
+            Ok(Response::Ok(mut rp)) => {
                 if rp == "0000" {
-                    return Ok(None);
+                    return Ok(vec![]);
                 } else {
-                    let mut splited = String::from(rp.trim());
-                    let yes: String = splited.drain(4..).collect();
-                    return Ok(Some(vec![String::from(yes)]));
+                    let response = rp.drain(4..).collect::<String>();
+                    let serials: Vec<&str> = response.split('\t').map(|s| s.trim()).collect();
+                    let serial_numbers: Vec<&str> = serials.iter().step_by(2).cloned().collect();
+                
+                    let mut serial_objects: Vec<Device> = Vec::new();
+                
+                    for serial in serial_numbers {
+                        let model = match serials.get(serials.iter().position(|&x| x == serial).unwrap() + 1) {
+                            Some(model) => model,
+                            None => continue,
+                        };
+                
+                        let serial_obj = Device {
+                            sock: self.s.try_clone().unwrap(),
+                            serial_no: serial.to_string(),
+                            model: model.to_string(),
+                        };
+                
+                        serial_objects.push(serial_obj);
+                    }
+                    Ok(serial_objects)
                 }
             }
             Ok(Response::Fail(rp)) => {
                 
-                return Err(Errors::ResponseRelated(Response::Fail(rp)));
+                return Err(PradbErrors::ResponseRelated(Response::Fail(rp)));
             }
             Ok(Response::Unknown(ro)) => {
-                return Err(Errors::Unknown(Some(ro)));
+                return Err(PradbErrors::Unknown(Some(ro)));
             }
             Err(AdbSocketError::RecvError(rp)) => {
-                return Err(Errors::AdbRelated(AdbSocketError::RecvError(rp)));
+                return Err(PradbErrors::AdbRelated(AdbSocketError::RecvError(rp)));
             }
             Err(_) => {
-                return Err(Errors::Unknown(None));
+                return Err(PradbErrors::Unknown(None));
             }
         }
     }
 
-    // Connects to a usb device
-    pub fn connect_local(&mut self, serial_no: String) -> Result<Response, Errors> {
-        Ok(self._exec_cmd(&format!("host:transport:{}", serial_no))?)
-    }
+    // /// Connects to a usb device
+    // pub fn device(&mut self, serial_no: String) -> Result<&Device, AdbDeviceError> {
+    //     // Ok(self._exec_cmd(&format!("host:transport:{}", serial_no))?)
+    //     let devices = self.devices()?;
+    //     let devices_clone = devices.clone();
+    //     let vec_devices = devices.iter().filter(|s| s.serial_no == serial_no).collect::<Vec<&Device>>();
+    //     if vec_devices.is_empty() {
+    //         Err(AdbDeviceError::DeviceNotFound(String::from("Device not found")))
+    //     } else {
+    //         Ok(vec_devices[0])
+    //     }
 
-    // Shutdown both channels of the socket
-    pub fn close(&mut self) -> Result<(), Errors> {
+    // }
+
+    /// Shutdown both channels of the socket
+    pub fn close(&mut self) -> Result<(), PradbErrors> {
         Ok(self.s.shutdown(std::net::Shutdown::Both)?)
     }
 
-    pub fn get_serial_no(&mut self) -> Result<Response, Errors> {
-        return Ok(self._exec_cmd("host:get-serialn")?);
-    }
+    // pub fn get_serial_no(&mut self) -> Result<Response, PradbErrors> {
+    //     return Ok(self._exec_cmd("host:get-serialn")?);
+    // }
 
-    // Returns version
-    pub fn version(&mut self) -> Result<Response, Errors> {
+    /// Returns version
+    pub fn version(&mut self) -> Result<Response, PradbErrors> {
         Ok(self._exec_cmd("host:version")?)
     }
 }

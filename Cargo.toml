@@ -1,9 +1,7 @@
 [package]
-name = "PureRustAdb"
+name = "pradb-test"
 version = "0.2.0"
 edition = "2021"
 
-[dependencies]
-env_logger = "0.10.0"
-log = "0.4.19"
-thiserror = "1.0.40"
+[dependencies.pradb]
+path = "../pradb"

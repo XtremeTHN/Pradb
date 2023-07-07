@@ -1,0 +1,6 @@
+{
+    "rust-analyzer.linkedProjects": [
+        "./pradb-test/Cargo.toml",
+        "./pradb/Cargo.toml"
+    ]
+}
