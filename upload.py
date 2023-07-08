@@ -65,21 +65,19 @@ print(args)
 
 version_splited = update_version(args.cp)
 
-if args.se:
+if not args.se:
     println("Checking source...")
-    wkd = os.getcwd()
     for x in args.cp:
         if not os.path.exists(x):
             eprintln("Cargo.toml not found!")
             sys.exit(1)
-        os.chdir(os.path.split(x)[0])
         print(os.getcwd())
-        code = os.system(f'cargo check')
+        code = os.system(f'cargo check --manifest-path {x}')
         if code > 0:
             println("Fix the errors of the source")
             eprintln(f"The 'cargo check' command returned {code}")
             sys.exit(1)
-    os.chdir(wkd)
+
 
 println("Adding files to a new commit...")
 os.system("git add .")
