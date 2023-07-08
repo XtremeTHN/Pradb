@@ -1,7 +1,9 @@
 use std::io::{self, Read, Write};
+use std::collections::HashMap;
 use std::net::TcpStream;
 use std::time::Instant;
 use thiserror::Error;
+use regex::Regex;
 
 use log::{debug, error as err, info};
 
@@ -10,10 +12,12 @@ use log::{debug, error as err, info};
 pub enum AdbSocketError {
     #[error("Server not running")]
     ServerError(String),
-    #[error("Cannot retrieve the server response")]
-    RecvError(String),
+    #[error("Invalid string recieved from server")]
+    InvalidString(#[from] std::string::FromUtf8Error),
+    #[error("Invalid hexadecimal value recieved from server")]
+    InvalidHex(#[from] std::num::ParseIntError),
     #[error("Socket writing error")]
-    WriteError(#[from] io::Error),
+    IOError(#[from] io::Error),
 }
 
 #[derive(Debug, Error)]
@@ -51,6 +55,14 @@ pub struct Adb {
     s: TcpStream,
 }
 
+#[derive(Debug, Error)]
+pub enum PropertiesErrors {
+    #[error("the adb socket caused an error")]
+    ServerError(#[from] AdbSocketError),
+    #[error("the server returned FAIL or unkown")]
+    ResponseError(String),
+}
+
 /// Future device class
 #[derive(Debug)]
 pub struct Device {
@@ -66,6 +78,39 @@ impl Device {
             serial_no: sn,
             model: model,
         })
+    }
+
+    pub fn use_device(&mut self) -> Result<Response, AdbSocketError> {
+        self.adb._exec_cmd(&format!("host:transport:{}", self.serial_no), false, false)
+    }
+
+    pub fn get_properties(&mut self) -> Result<HashMap<String, String>, PropertiesErrors> {
+        let unformatted_props = self.adb._exec_cmd(&format!("shell:getprop"), true, false)?;
+        match unformatted_props {
+            Response::Ok(props) => {
+                // let properties: HashMap<String, String> = props
+                // .lines()
+                // .filter_map(|line| {
+                //     let mut parts = line.splitn(2, '=');
+                //     Some((parts.next()?.to_owned(), parts.next()?.to_owned()))
+                // })
+                // .collect();
+                // Ok(properties)
+                let result_pattern = Regex::new(r"^\[([\s\S]*?)\]: \[([\s\S]*?)\]\r?$").unwrap();
+
+                let mut properties = HashMap::new();
+                for line in props.split('\n') {
+                    if let Some(captures) = result_pattern.captures(line) {
+                        let key = captures.get(1).unwrap().as_str().to_string();
+                        let value = captures.get(2).unwrap().as_str().to_string();
+                        properties.insert(key, value);
+                    }
+                }
+            
+                Ok(properties)
+            },
+            Response::Fail(err) | Response::Unknown(err) => Err(PropertiesErrors::ResponseError(err)),
+        }
     }
 
     pub fn getserial_no(&self) -> String {
@@ -92,66 +137,60 @@ impl Adb {
     }
 
     /// Private method; Sends the gived command to the server
-    fn _exec_cmd(&mut self, cmd: &str) -> Result<Response, AdbSocketError> {
+    fn _exec_cmd(&mut self, cmd: &str, read_response: bool, has_length: bool) -> Result<Response, AdbSocketError> {
         debug!(
             "[Adb::_exec_cmd()]: _exec_cmd called with command '{}'...",
             cmd
         );
         debug!("[Adb::_exec_cmd()]: Preparing header...");
         let hex_length = format!("{:04X}{}", cmd.len(), cmd);
-        debug!("[Adb::_exec_cmd()]: Sending request...");
 
-        let send_time: Instant = Instant::now();
+        debug!("[Adb::_exec_cmd()]: Sending request...");
         self.s.write_all(hex_length.as_bytes())?;
-        debug!(
-            "[Adb::_exec_cmd()]: Took {}s",
-            send_time.elapsed().as_secs_f32()
-        );
 
         debug!("[Adb::_exec_cmd()]: Recieving response...");
-        let recv_time: Instant = Instant::now();
         let mut buffer = [0; 4];
         self.s.read_exact(&mut buffer)?;
-        debug!(
-            "[Adb::_exec_cmd()]: Took {}s",
-            recv_time.elapsed().as_secs_f32()
-        );
+        let rp = String::from_utf8(buffer.to_vec())?;
 
-        match String::from_utf8(buffer.to_vec()) {
-            Ok(rp) => {
-                let mut string_buff = String::new();
+        let mut string_buff = String::new();
+        if read_response {
+            if has_length {
+                // Recieving the response length
+                let mut response_length = [0; 4];
+                self.s.read_exact(&mut response_length)?;
+                let hex_length = i32::from_str_radix(&String::from_utf8(response_length.to_vec())?, 16)?;
 
-                if let Err(err) = self.s.read_to_string(&mut string_buff) {
-                    err!("[Adb::_exec_cmd()]: Error while trying to read the server response. Error: {err}");
-                }
+                // Recieving the response
+                let mut response = vec![0; hex_length as usize];
+                self.s.read_exact(&mut response)?;
 
-                debug!("{:?}", string_buff);
-                debug!("[Adb::_exec_cmd()] Returning the string recievied...");
-                if &rp == "OKAY" {
-                    debug!("Returning ok");
-                    return Ok(Response::Ok(string_buff));
-                } else if &rp == "FAIL" {
-                    return Ok(Response::Fail(string_buff.drain(4..).collect()));
-                } else {
-                    return Ok(Response::Unknown(string_buff));
-                }
+                string_buff = String::from_utf8(response)?;
+            } else {
+                self.s.read_to_string(&mut string_buff)?;
             }
-            Err(err) => {
-                return Err(AdbSocketError::RecvError(err.to_string()));
-            }
+            debug!("{:?}", string_buff);
+            debug!("[Adb::_exec_cmd()] Returning the string recievied...");
+        }
+        if &rp == "OKAY" {
+            debug!("Returning ok");
+            return Ok(Response::Ok(string_buff));
+        } else if &rp == "FAIL" {
+            return Ok(Response::Fail(string_buff));
+        } else {
+            return Ok(Response::Unknown(string_buff));
         }
     }
 
     /// Return a list of devices
     pub fn devices(&mut self) -> Result<Vec<Device>, PradbErrors> {
-        let devices = self._exec_cmd("host:devices")?;
+        let devices = self._exec_cmd("host:devices", true, true)?;
         match devices {
-            Response::Ok(mut rp) => {
+            Response::Ok(rp) => {
                 if rp == "0000" {
                     return Ok(vec![]);
                 } else {
-                    let response = rp.drain(4..).collect::<String>();
-                    let devices = response.split('\n').filter(|s| !s.is_empty()).map(|s| {
+                    let devices = rp.split('\n').filter(|s| !s.is_empty()).map(|s| {
                         let device_data = s.split("\t").collect::<Vec<&str>>();
                         Device::new(device_data[0].to_string(), device_data[1].to_string()).unwrap()
                     }).collect::<Vec<Device>>();
@@ -188,6 +227,6 @@ impl Adb {
 
     /// Returns version
     pub fn version(&mut self) -> Result<Response, PradbErrors> {
-        Ok(self._exec_cmd("host:version")?)
+        Ok(self._exec_cmd("host:version", true, true)?)
     }
 }

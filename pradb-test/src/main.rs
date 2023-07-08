@@ -8,8 +8,8 @@ fn main() {
         log::error!("Couldnt get devices");
         exit(1);
     }
-    let devices = dev_res.unwrap();
-    for dev in devices {
-        println!("Serial number: {}", dev.getserial_no());
-    }
+    let mut devices = dev_res.unwrap();
+    let emu = devices.get_mut(0).unwrap();
+    emu.use_device();
+    println!("{:?}", emu.get_properties());
 }
