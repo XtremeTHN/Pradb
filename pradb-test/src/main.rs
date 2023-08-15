@@ -1,4 +1,5 @@
 extern crate pradb;
+use std::path::PathBuf;
 use std::process::exit;
 fn main() {
     env_logger::init();
@@ -11,5 +12,7 @@ fn main() {
     let mut devices = dev_res.unwrap();
     let emu = devices.get_mut(0).unwrap();
     emu.use_device();
-    println!("{:?}", emu.get_properties());
+
+    let package_path = PathBuf::from("package.apk");
+    println!("{:?}", emu.install_package(package_path));
 }

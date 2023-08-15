@@ -1,11 +1,20 @@
-use std::io::{self, Read, Write};
-use std::collections::HashMap;
-use std::net::TcpStream;
-use std::time::Instant;
-use thiserror::Error;
 use regex::Regex;
+use std::collections::HashMap;
+use std::io::{self, Read, Write};
+use std::net::TcpStream;
+use std::path::PathBuf;
+use thiserror::Error;
 
 use log::{debug, error as err, info};
+
+const NO_PREFIX: bool = false;
+const HAVE_PREFIX: bool = true;
+
+const NO_RESPONSE: bool = false;
+const HAVE_RESPONSE: bool = true;
+
+const NO_LENGTH: bool = false;
+const HAVE_LENGTH: bool = true;
 
 /// Adb errors
 #[derive(Debug, Error)]
@@ -26,6 +35,23 @@ pub enum AdbDeviceError {
     DeviceNotFound(String),
     #[error("Placeholder")]
     GeneralErrors(#[from] PradbErrors),
+}
+
+#[derive(Debug, Error)]
+pub enum AdbShellError {
+    #[error("socket error")]
+    SocketError(#[from] AdbSocketError),
+    #[error("the server returned FAIL or unkown")]
+    ResponseError(String),
+    #[error("unknown error")]
+    Unknown,
+    #[error("could not parse the exit code")]
+    InvalidExitCode(#[from] std::num::ParseIntError),
+}
+
+pub struct CommandResult {
+    output: String,
+    exit_code: i32,
 }
 
 // Enum representing the possible results returned by the server
@@ -63,12 +89,41 @@ pub enum PropertiesErrors {
     ResponseError(String),
 }
 
+#[derive(Debug, Error)]
+pub enum SinglePropertyErrors {
+    #[error("the adb socket caused an error")]
+    ServerError(#[from] AdbSocketError),
+    #[error("unknown property")]
+    UnknownProperty(String),
+}
+
+#[derive(Debug, Error)]
+pub enum PackagesError {
+    #[error("the adb socket caused an error")]
+    ServerError(#[from] AdbSocketError),
+    #[error("the server returned FAIL or unkown")]
+    ResponseError(String),
+}
+
+#[derive(Debug, Error)]
+pub enum InstallError {
+    #[error("the adb socket caused an error")]
+    ServerError(#[from] AdbShellError),
+    #[error("the server returned FAIL or unkown")]
+    ResponseError(String),
+    #[error("cannot install package")]
+    PackageNotInstalled(String),
+    #[error("package don't exist")]
+    FileNotFound,
+}
+
 /// Future device class
 #[derive(Debug)]
 pub struct Device {
     adb: Adb,
     serial_no: String,
     model: String,
+    using_device: bool,
 }
 
 impl Device {
@@ -76,26 +131,42 @@ impl Device {
         Ok(Device {
             adb: Adb::new()?,
             serial_no: sn,
-            model: model,
+            model,
+            using_device: false,
         })
     }
 
     pub fn use_device(&mut self) -> Result<Response, AdbSocketError> {
-        self.adb._exec_cmd(&format!("host:transport:{}", self.serial_no), false, false)
+        let response = self.adb._exec_cmd(
+            &format!("host:transport:{}", self.serial_no),
+            HAVE_PREFIX,
+            NO_RESPONSE,
+            NO_LENGTH,
+        )?;
+        self.using_device = true;
+        Ok(response)
+    }
+
+    /// Sends a shell command to the server
+    pub fn shell(&mut self, cmd: &str) -> Result<String, AdbShellError> {
+        let cmd_output = self.adb._exec_cmd(
+            &format!("shell:{}", cmd),
+            HAVE_PREFIX,
+            HAVE_RESPONSE,
+            NO_LENGTH,
+        )?;
+        match cmd_output {
+            Response::Ok(output) => Ok(output),
+            Response::Fail(err) | Response::Unknown(err) => Err(AdbShellError::ResponseError(err)),
+        }
     }
 
     pub fn get_properties(&mut self) -> Result<HashMap<String, String>, PropertiesErrors> {
-        let unformatted_props = self.adb._exec_cmd(&format!("shell:getprop"), true, false)?;
+        let unformatted_props =
+            self.adb
+                ._exec_cmd("shell:getprop:", HAVE_PREFIX, HAVE_RESPONSE, NO_LENGTH)?;
         match unformatted_props {
             Response::Ok(props) => {
-                // let properties: HashMap<String, String> = props
-                // .lines()
-                // .filter_map(|line| {
-                //     let mut parts = line.splitn(2, '=');
-                //     Some((parts.next()?.to_owned(), parts.next()?.to_owned()))
-                // })
-                // .collect();
-                // Ok(properties)
                 let result_pattern = Regex::new(r"^\[([\s\S]*?)\]: \[([\s\S]*?)\]\r?$").unwrap();
 
                 let mut properties = HashMap::new();
@@ -106,10 +177,57 @@ impl Device {
                         properties.insert(key, value);
                     }
                 }
-            
+
                 Ok(properties)
-            },
-            Response::Fail(err) | Response::Unknown(err) => Err(PropertiesErrors::ResponseError(err)),
+            }
+            Response::Fail(err) | Response::Unknown(err) => {
+                Err(PropertiesErrors::ResponseError(err))
+            }
+        }
+    }
+
+    pub fn get_property(&mut self, property: &str) -> Result<Response, SinglePropertyErrors> {
+        Ok(self.adb._exec_cmd(
+            &format!("shell:getprop:{}", property),
+            HAVE_PREFIX,
+            NO_RESPONSE,
+            NO_LENGTH,
+        )?)
+    }
+
+    pub fn list_packages(&mut self) -> Result<Vec<String>, PackagesError> {
+        let unformatted_pkgs = self.adb._exec_cmd(
+            "shell:pm list packages 2> /dev/null",
+            HAVE_PREFIX,
+            HAVE_RESPONSE,
+            NO_LENGTH,
+        )?;
+        match unformatted_pkgs {
+            Response::Ok(pkgs) => {
+                let lines = pkgs
+                    .split('\n')
+                    .filter(|line| !line.is_empty())
+                    .map(|line| line.to_string().drain(8..).collect::<String>());
+
+                Ok(lines.collect::<Vec<String>>())
+            }
+            Response::Fail(err) | Response::Unknown(err) => Err(PackagesError::ResponseError(err)),
+        }
+    }
+
+    pub fn install_package(&mut self, package: PathBuf) -> Result<(), InstallError> {
+        if !package.exists() {
+            return Err(InstallError::FileNotFound);
+        }
+
+        let pkg_output = self.shell(&format!(
+            "pm install {}",
+            package.as_os_str().to_str().unwrap()
+        ))?;
+        if pkg_output.contains("Error:") {
+            Err(InstallError::PackageNotInstalled(pkg_output))
+        } else {
+            Ok(())
         }
     }
 
@@ -126,18 +244,24 @@ impl Adb {
         match socket {
             Ok(sock) => {
                 info!("Adb::new(): Sucessfully connected to the adb server");
-                return Ok(Adb { s: sock });
+                Ok(Adb { s: sock })
             }
             Err(err) => {
                 err!("Adb::new(): Couldn't connect to the server. Error: {}", err);
                 err!("Adb::new(): Trying to run server...");
-                return Err(AdbSocketError::ServerError(err.to_string()));
+                Err(AdbSocketError::ServerError(err.to_string()))
             }
         }
     }
 
     /// Private method; Sends the gived command to the server
-    fn _exec_cmd(&mut self, cmd: &str, read_response: bool, has_length: bool) -> Result<Response, AdbSocketError> {
+    fn _exec_cmd(
+        &mut self,
+        cmd: &str,
+        has_prefix: bool,
+        read_response: bool,
+        has_length: bool,
+    ) -> Result<Response, AdbSocketError> {
         debug!(
             "[Adb::_exec_cmd()]: _exec_cmd called with command '{}'...",
             cmd
@@ -148,18 +272,26 @@ impl Adb {
         debug!("[Adb::_exec_cmd()]: Sending request...");
         self.s.write_all(hex_length.as_bytes())?;
 
-        debug!("[Adb::_exec_cmd()]: Recieving response...");
-        let mut buffer = [0; 4];
-        self.s.read_exact(&mut buffer)?;
-        let rp = String::from_utf8(buffer.to_vec())?;
+        let rp = {
+            if has_prefix {
+                debug!("[Adb::_exec_cmd()]: Recieving response...");
+                let mut buffer = vec![0; 4];
+                self.s.read_exact(&mut buffer)?;
+                String::from_utf8(buffer.to_vec())?
+            } else {
+                String::new()
+            }
+        };
 
+        debug!("[Adb::_exec_cmd()]: Creating buffer...");
         let mut string_buff = String::new();
         if read_response {
             if has_length {
                 // Recieving the response length
                 let mut response_length = [0; 4];
                 self.s.read_exact(&mut response_length)?;
-                let hex_length = i32::from_str_radix(&String::from_utf8(response_length.to_vec())?, 16)?;
+                let hex_length =
+                    i32::from_str_radix(&String::from_utf8(response_length.to_vec())?, 16)?;
 
                 // Recieving the response
                 let mut response = vec![0; hex_length as usize];
@@ -174,35 +306,36 @@ impl Adb {
         }
         if &rp == "OKAY" {
             debug!("Returning ok");
-            return Ok(Response::Ok(string_buff));
+            Ok(Response::Ok(string_buff))
         } else if &rp == "FAIL" {
-            return Ok(Response::Fail(string_buff));
+            Ok(Response::Fail(string_buff))
         } else {
-            return Ok(Response::Unknown(string_buff));
+            Ok(Response::Unknown(string_buff))
         }
     }
 
     /// Return a list of devices
     pub fn devices(&mut self) -> Result<Vec<Device>, PradbErrors> {
-        let devices = self._exec_cmd("host:devices", true, true)?;
+        let devices = self._exec_cmd("host:devices", HAVE_PREFIX, HAVE_RESPONSE, HAVE_LENGTH)?;
         match devices {
             Response::Ok(rp) => {
                 if rp == "0000" {
-                    return Ok(vec![]);
+                    Ok(vec![])
                 } else {
-                    let devices = rp.split('\n').filter(|s| !s.is_empty()).map(|s| {
-                        let device_data = s.split("\t").collect::<Vec<&str>>();
-                        Device::new(device_data[0].to_string(), device_data[1].to_string()).unwrap()
-                    }).collect::<Vec<Device>>();
+                    let devices = rp
+                        .split('\n')
+                        .filter(|s| !s.is_empty())
+                        .map(|s| {
+                            let device_data = s.split('\t').collect::<Vec<&str>>();
+                            Device::new(device_data[0].to_string(), device_data[1].to_string())
+                                .unwrap()
+                        })
+                        .collect::<Vec<Device>>();
                     Ok(devices)
                 }
             }
-            Response::Fail(rp) => {
-                return Err(PradbErrors::ResponseRelated(Response::Fail(rp)));
-            }
-            Response::Unknown(ro) => {
-                return Err(PradbErrors::Unknown(Some(ro)));
-            }
+            Response::Fail(rp) => Err(PradbErrors::ResponseRelated(Response::Fail(rp))),
+            Response::Unknown(ro) => Err(PradbErrors::Unknown(Some(ro))),
         }
     }
 
@@ -227,6 +360,12 @@ impl Adb {
 
     /// Returns version
     pub fn version(&mut self) -> Result<Response, PradbErrors> {
-        Ok(self._exec_cmd("host:version", true, true)?)
+        Ok(self._exec_cmd("host:version", HAVE_PREFIX, HAVE_RESPONSE, HAVE_LENGTH)?)
     }
 }
+
+// fn is_normal<T: Sized + Send + Sync + Unpin>() {}
+
+// fn test() {
+//     is_normal::<Device>();
+// }
